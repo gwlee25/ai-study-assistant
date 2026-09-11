@@ -8,18 +8,24 @@ from google import genai
 from google.genai import types
 from supabase import create_client, Client
 
-st.set_page_config(page_title="AI 학습 도우미 (클라우드 저장)", page_icon="📚", layout="wide")
+st.set_page_config(page_title="AI 학습 도우미", page_icon="📚", layout="wide")
 st.title("📚 AI 학습 도우미: 클라우드 영구 보관 & 퀴즈 생성기")
 
 # ---------- 1. Supabase 클라이언트 초기화 ----------
-supabase_url = st.secrets.get("SUPABASE_URL") or os.getenv("SUPABASE_URL")
-supabase_key = st.secrets.get("SUPABASE_KEY") or os.getenv("SUPABASE_KEY")
+raw_url = st.secrets.get("SUPABASE_URL") or os.getenv("SUPABASE_URL") or ""
+supabase_key = st.secrets.get("SUPABASE_KEY") or os.getenv("SUPABASE_KEY") or ""
+
+supabase_url = raw_url.strip().rstrip("/")
 
 if not supabase_url or not supabase_key:
     st.error("⚠️ Supabase 연동 정보(SUPABASE_URL, SUPABASE_KEY)가 Secrets에 설정되지 않았습니다.")
     st.stop()
 
-supabase: Client = create_client(supabase_url, supabase_key)
+@st.cache_resource
+def init_supabase(url: str, key: str) -> Client:
+    return create_client(url, key)
+
+supabase = init_supabase(supabase_url, supabase_key)
 
 # ---------- 2. 파일 추출 함수 ----------
 def extract_pdf(data):
@@ -57,12 +63,16 @@ def extract(data, filename):
         return extract_pdf(data)
     if ext == ".pptx":
         return pptx_to_images(data)
-    raise ValueError("PDF 또는 PPTX만 지원합니다.")
+    raise ValueError("PDF 또는 PPTX 파일만 지원합니다.")
 
 # ---------- 3. DB 작업 헬퍼 함수 ----------
 def fetch_user_data(username):
-    response = supabase.table("user_documents").select("*").eq("username", username).execute()
-    return response.data or []
+    try:
+        response = supabase.table("user_documents").select("*").eq("username", username).execute()
+        return response.data or []
+    except Exception as e:
+        st.error(f"데이터베이스 조회 오류: {e}")
+        return []
 
 def save_document(username, folder_name, filename, slides):
     existing = supabase.table("user_documents").select("id")\
@@ -184,10 +194,10 @@ Output MUST strictly follow this JSON schema:
 
     return None, f"서버 과부하로 실패했습니다. 잠시 후 다시 시도해주세요. ({last_error})"
 
-# ---------- 5. 사이드바 UI (사용자 식별 & 설정) ----------
+# ---------- 5. 사이드바 UI (사용자 식별 & 폴더/퀴즈 설정) ----------
 with st.sidebar:
     st.header("👤 계정 접속")
-    username_input = st.text_input("사용자 이름(ID 또는 핀번호)", placeholder="예: user1234, 철수").strip()
+    username_input = st.text_input("사용자 이름(ID 또는 핀번호)", placeholder="예: user1234, 시험대비").strip()
     
     if not username_input:
         st.warning("계정 이름을 입력해야 개인 저장소가 활성화됩니다.")
@@ -195,26 +205,49 @@ with st.sidebar:
         
     st.success(f"접속 계정: **{username_input}**")
 
-    # DB에서 현재 사용자의 데이터 로드
+    # DB에서 사용자의 파일 기록 조회
     user_records = fetch_user_data(username_input)
     
     st.markdown("---")
     st.header("📁 폴더 관리")
     
-    # 등록된 폴더 목록 추출
-    existing_folders = sorted(list(set([r["folder_name"] for r in user_records] + ["기본 강의자료"])))
+    # 세션 상태에 폴더 리스트 초기화 (빈 폴더 증발 방지)
+    if "custom_folders" not in st.session_state:
+        st.session_state["custom_folders"] = ["기본 강의자료"]
     
-    new_folder = st.text_input("새 폴더 생성", placeholder="폴더 이름")
-    if st.button("➕ 폴더 추가") and new_folder.strip():
-        if new_folder.strip() not in existing_folders:
-            existing_folders.append(new_folder.strip())
-            st.rerun()
+    # DB에 저장된 파일들의 폴더명도 자동으로 리스트에 통합
+    db_folders = [r["folder_name"] for r in user_records if r.get("folder_name")]
+    for df in db_folders:
+        if df not in st.session_state["custom_folders"]:
+            st.session_state["custom_folders"].append(df)
+            
+    col_f_in, col_f_btn = st.columns([2, 1])
+    with col_f_in:
+        new_folder = st.text_input("새 폴더", placeholder="폴더명", label_visibility="collapsed")
+    with col_f_btn:
+        if st.button("➕ 추가"):
+            clean_name = new_folder.strip()
+            if clean_name and clean_name not in st.session_state["custom_folders"]:
+                st.session_state["custom_folders"].append(clean_name)
+                st.session_state["selected_folder_idx"] = len(st.session_state["custom_folders"]) - 1
+                st.rerun()
 
-    current_folder = st.selectbox("현재 작업 폴더", existing_folders)
+    # 현재 작업 폴더 선택
+    curr_idx = st.session_state.get("selected_folder_idx", 0)
+    if curr_idx >= len(st.session_state["custom_folders"]):
+        curr_idx = 0
+        
+    current_folder = st.selectbox(
+        "작업 폴더 선택", 
+        st.session_state["custom_folders"], 
+        index=curr_idx
+    )
+    st.session_state["selected_folder_idx"] = st.session_state["custom_folders"].index(current_folder)
 
     st.markdown("---")
     st.header("⚙️ 퀴즈 옵션")
-    n = st.slider("문제 수", 1, 20, 5)
+    # 디폴트 10문제 설정
+    n = st.slider("문제 수", 1, 20, value=10)
     types_selected = st.multiselect("문제 유형", ["Multiple Choice", "True/False", "Short Answer"], ["Multiple Choice"])
     difficulty = st.select_slider("난이도", ["Basic", "Intermediate", "Advanced", "Exam Level"], value="Intermediate")
     model = st.selectbox("Gemini 모델", ["gemini-3.6-flash", "gemini-3.8-flash"], index=0)
@@ -224,7 +257,7 @@ st.subheader(f"📂 폴더: `{current_folder}` (계정: `{username_input}`)")
 
 uploaded_files = st.file_uploader("📎 새 강의 자료 업로드 (PPTX, PDF)", type=["pdf", "pptx"], accept_multiple_files=True)
 if uploaded_files:
-    with st.spinner("파일을 파싱하여 클라우드에 영구 보관 중..."):
+    with st.spinner("파일을 분석하여 클라우드에 영구 저장 중..."):
         for up in uploaded_files:
             try:
                 extracted_slides = extract(up.getvalue(), up.name)
@@ -236,10 +269,10 @@ if uploaded_files:
         st.rerun()
 
 # 현재 폴더에 속한 문서만 필터링
-folder_docs = [r for r in user_records if r["folder_name"] == current_folder]
+folder_docs = [r for r in user_records if r.get("folder_name") == current_folder]
 
 if not folder_docs:
-    st.info("이 폴더에 저장된 파일이 없습니다. 자료를 업로드해 두면 새로고침해도 영구 유지됩니다.")
+    st.info(f"'{current_folder}' 폴더에 보관된 파일이 없습니다. 위에서 자료를 업로드해 주세요.")
     st.stop()
 
 # 파일 선택 및 삭제 UI
