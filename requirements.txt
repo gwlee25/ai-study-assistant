@@ -2,3 +2,4 @@ streamlit
 pypdf
 python-pptx
 google-genai
+supabase
