@@ -26,7 +26,7 @@ def init_supabase(url: str, key: str) -> Client:
 
 supabase = init_supabase(supabase_url, supabase_key)
 
-# ---------- 2. 파일 파싱 및 시각자료 추출 ----------
+# ---------- 2. 파일 파싱 및 원본 시각자료 추출 ----------
 def extract_pdf(data):
     reader = PdfReader(io.BytesIO(data))
     pages = []
@@ -64,7 +64,7 @@ def extract(data, filename):
         return pptx_to_images(data)
     raise ValueError("PDF 또는 PPTX 파일만 지원합니다.")
 
-# ---------- 3. DB 함수 ----------
+# ---------- 3. DB 영구 보관 헬퍼 함수 ----------
 def fetch_user_folders(username):
     try:
         res = supabase.table("user_folders").select("folder_name").eq("username", username).order("created_at").execute()
@@ -124,7 +124,7 @@ def delete_folder(username, folder_name):
 @st.dialog("⚠️ 폴더 삭제 확인")
 def confirm_delete_folder_dialog(username, folder_name):
     st.write(f"정말로 **'{folder_name}'** 폴더를 삭제하시겠습니까?")
-    st.warning("폴더와 그 안에 보관된 모든 문서 및 데이터가 함께 영구 삭제됩니다.")
+    st.warning("폴더와 그 안에 보관된 모든 문서 및 퀴즈 데이터가 함께 영구 삭제됩니다.")
     c1, c2 = st.columns(2)
     with c1:
         if st.button("예, 삭제합니다", type="primary", use_container_width=True):
@@ -147,41 +147,15 @@ def confirm_delete_file_dialog(doc_id, filename):
         if st.button("취소", use_container_width=True):
             st.rerun()
 
-# ---------- 5. Gemini AI 분리 분석 로직 ----------
-def call_gemini_api(contents, system_instruction, model_name):
-    api_key = st.secrets.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        return None, "Gemini API 키가 설정되지 않았습니다."
-
-    client = genai.Client(api_key=api_key)
-    models_to_try = [model_name, "gemini-3.6-flash", "gemini-3.8-flash"]
-    models_to_try = list(dict.fromkeys(models_to_try))
-
-    last_error = ""
-    for target_model in models_to_try:
-        for _ in range(2):
-            try:
-                response = client.models.generate_content(
-                    model=target_model,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction=system_instruction,
-                        response_mime_type="application/json",
-                        temperature=0.2
-                    )
-                )
-                return json.loads(response.text), None
-            except Exception as e:
-                last_error = str(e)
-                if "503" in last_error:
-                    time.sleep(3)
-                    continue
-                elif "404" in last_error:
-                    break
-                else:
-                    return None, f"오류 발생: {last_error}"
-
-    return None, f"서버 과부하로 실패했습니다. 잠시 후 다시 시도해주세요. ({last_error})"
+# ---------- 5. Gemini AI 고도화 분석 및 다중 모델 우회 ----------
+# 좋은 성능 순서대로 나열된 우선순위 모델 풀
+HIGH_TIER_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.6-flash",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite"
+]
 
 def prepare_gemini_contents(slides):
     contents = []
@@ -196,7 +170,50 @@ def prepare_gemini_contents(slides):
                 pass
     return contents
 
-# A. 상세 한국어 요약 전용 호출
+def call_gemini_api_with_fallback(contents, system_instruction, preferred_model):
+    """
+    선택된 모델 -> 고성능 순서 -> 경량 순서로 429/503 오류 발생 시 자동 우회 호출
+    """
+    api_key = st.secrets.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        return None, "Gemini API 키가 설정되지 않았습니다."
+
+    client = genai.Client(api_key=api_key)
+
+    # 사용자가 선택한 모델을 0순위로 두고, 그 뒤로 상위 모델부터 차례대로 풀 구성
+    model_pipeline = [preferred_model] + HIGH_TIER_MODELS
+    unique_pipeline = list(dict.fromkeys(model_pipeline))
+
+    last_error = ""
+    for target_model in unique_pipeline:
+        try:
+            response = client.models.generate_content(
+                model=target_model,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    response_mime_type="application/json",
+                    temperature=0.2
+                )
+            )
+            return json.loads(response.text), None
+        except Exception as e:
+            last_error = str(e)
+            # 429(할당량 소진/RPM 초과) 또는 503(서버 과부하) 발생 시 다음 모델로 즉각 Fallback
+            if any(k in last_error for k in ["429", "503", "RESOURCE_EXHAUSTED", "UNAVAILABLE"]):
+                time.sleep(1.5)
+                continue
+            elif "404" in last_error:
+                continue
+            else:
+                return None, f"오류 발생 ({target_model}): {last_error}"
+
+    return None, (
+        f"모든 지원 모델의 일일 무료 할당량(Quota)이 소진되었습니다. "
+        f"잠시 후 다시 시도하거나, Google AI Studio에서 새 API 키를 발급받아 Secrets에 등록해 주세요. "
+        f"(마지막 에러: {last_error})"
+    )
+
 def ai_generate_summary(slides, model_name):
     instruction = """
 You are an elite university lecture specialist.
@@ -225,9 +242,8 @@ Output MUST strictly follow this JSON schema:
 }
 """
     contents = prepare_gemini_contents(slides)
-    return call_gemini_api(contents, instruction, model_name)
+    return call_gemini_api_with_fallback(contents, instruction, model_name)
 
-# B. 영문 퀴즈(한국어 해설) 단독 생성 호출
 def ai_generate_quiz(slides, settings):
     instruction = f"""
 You are an elite university exam tutor.
@@ -256,9 +272,9 @@ Output MUST strictly follow this JSON schema:
 }}
 """
     contents = prepare_gemini_contents(slides)
-    return call_gemini_api(contents, instruction, settings["model"])
+    return call_gemini_api_with_fallback(contents, instruction, settings["model"])
 
-# ---------- 6. 세션 네비게이션 상태 ----------
+# ---------- 6. 네비게이션 상태 초기화 ----------
 if "nav_view" not in st.session_state:
     st.session_state["nav_view"] = "folder"
 if "active_folder" not in st.session_state:
@@ -278,15 +294,23 @@ with st.sidebar:
     st.success(f"접속 중: **{username_input}**")
 
     st.markdown("---")
-    st.header("⚙️ 퀴즈 생성 옵션")
+    st.header("⚙️ 퀴즈 옵션")
     quiz_n = st.slider("문제 수", 1, 20, value=10)
     quiz_types = st.multiselect("문제 유형", ["Multiple Choice", "True/False", "Short Answer"], ["Multiple Choice"])
     quiz_diff = st.select_slider("난이도", ["Basic", "Intermediate", "Advanced", "Exam Level"], value="Intermediate")
-    quiz_model = st.selectbox("Gemini 모델", ["gemini-3.6-flash", "gemini-3.8-flash"], index=0)
+    
+    # 성능 순서대로 정렬된 모델 선택 드롭다운
+    quiz_model = st.selectbox(
+        "우선 사용 모델 (우회 시작점)", 
+        HIGH_TIER_MODELS, 
+        index=0,
+        help="선택한 모델의 할당량이 차면 하위 모델로 자동 우회 시도합니다."
+    )
 
 db_folders = fetch_user_folders(username_input)
 user_records = fetch_user_data(username_input)
 
+# 문서에 있는 폴더 동기화
 for r in user_records:
     fn = r.get("folder_name")
     if fn and fn not in db_folders:
@@ -302,7 +326,7 @@ if not db_folders:
 # =========================================================
 if st.session_state["nav_view"] == "folder":
     st.title("📂 내 강의자료 폴더")
-    st.caption("폴더를 클릭하여 내부 PPT/PDF 목록을 확인하세요.")
+    st.caption("폴더를 클릭하여 내부 PPT/PDF 목록을 확인하세요. 빈 폴더도 영구 보관됩니다.")
 
     col_nf1, col_nf2 = st.columns([3, 1])
     with col_nf1:
@@ -338,7 +362,7 @@ if st.session_state["nav_view"] == "folder":
                                 st.session_state["nav_view"] = "file"
                                 st.rerun()
                         with b_col2:
-                            if st.button("🗑️", key=f"del_f_{f_name}", use_container_width=True, help="폴더 삭제"):
+                            if st.button("🗑️", key=f"del_f_{f_name}", use_container_width=True, help="폴더 영구 삭제"):
                                 confirm_delete_folder_dialog(username_input, f_name)
 
 # =========================================================
@@ -422,7 +446,7 @@ elif st.session_state["nav_view"] == "file":
                                     confirm_delete_file_dialog(doc_id, fname)
 
 # =========================================================
-# 화면 3: 문서 상세 뷰
+# 화면 3: 문서 상세 뷰 (요약 & 퀴즈 독립 제어 및 누적 보관)
 # =========================================================
 elif st.session_state["nav_view"] == "detail":
     doc_id = st.session_state["active_doc_id"]
@@ -439,11 +463,10 @@ elif st.session_state["nav_view"] == "detail":
     fname = current_doc["filename"]
     slides = current_doc["slides_data"]
     
-    # 분석 데이터 구조 정규화 (하위 호환)
+    # 히스토리 데이터 구조 정규화
     analysis_result = current_doc.get("analysis_result") or {}
     if "quiz_history" not in analysis_result:
         analysis_result["quiz_history"] = []
-        # 과거 단일 questions 필드가 있었다면 1회차로 자동 변환
         if "questions" in analysis_result and analysis_result["questions"]:
             analysis_result["quiz_history"].append({
                 "set_name": "Quiz Set #1 (기존)",
@@ -461,7 +484,7 @@ elif st.session_state["nav_view"] == "detail":
     st.title(f"📖 {fname}")
     st.caption(f"폴더: {curr_f} | 슬라이드 수: {len(slides)}장")
 
-    tab1, tab2, tab3 = st.tabs(["📑 슬라이드 원본", "📝 상세 한국어 요약노트", "🎯 English Quiz (히스토리 보관)"])
+    tab1, tab2, tab3 = st.tabs(["📑 슬라이드 원본", "📝 상세 한국어 요약노트", "🎯 English Quiz (누적 히스토리)"])
 
     # --- 탭 1: 슬라이드 원본 ---
     with tab1:
@@ -479,12 +502,11 @@ elif st.session_state["nav_view"] == "detail":
             run_summary_btn = st.button("🚀 상세 요약노트 생성/갱신", type="primary", key="btn_run_summary")
 
         if run_summary_btn:
-            with st.spinner("AI가 페이지별 세부 내용과 시각자료를 빠짐없이 요약 중입니다..."):
+            with st.spinner("AI 모델 파이프라인이 최적의 모델을 찾아 상세 요약을 작성 중입니다..."):
                 summary_data, err = ai_generate_summary(slides, quiz_model)
             if err:
                 st.error(err)
             else:
-                # 기존 퀴즈 히스토리는 유지하고 요약 부분만 갱신
                 analysis_result["overall_summary"] = summary_data.get("overall_summary")
                 analysis_result["page_summaries"] = summary_data.get("page_summaries")
                 analysis_result["key_terminology"] = summary_data.get("key_terminology")
@@ -516,7 +538,7 @@ elif st.session_state["nav_view"] == "detail":
         else:
             st.info("상단의 **'🚀 상세 요약노트 생성/갱신'** 버튼을 누르면 AI 요약이 실행됩니다.")
 
-    # --- 탭 3: 퀴즈 단독 생성 및 회차별 히스토리 열람 ---
+    # --- 탭 3: 퀴즈 단독 생성 및 누적 보관 ---
     with tab3:
         col_btn3, _ = st.columns([1, 3])
         with col_btn3:
@@ -529,7 +551,7 @@ elif st.session_state["nav_view"] == "detail":
                 "difficulty": quiz_diff,
                 "model": quiz_model
             }
-            with st.spinner("AI가 슬라이드 기반으로 새로운 영문 퀴즈를 출제 중입니다..."):
+            with st.spinner("AI 모델 파이프라인이 영문 퀴즈를 출제 중입니다 (할당량 초과 시 자동 우회)..."):
                 quiz_data, err = ai_generate_quiz(slides, settings)
             if err:
                 st.error(err)
@@ -542,7 +564,6 @@ elif st.session_state["nav_view"] == "detail":
                     "created_at": now_str,
                     "questions": new_q_list
                 }
-                # 맨 앞에 추가하여 최신 퀴즈가 기본으로 뜨도록 처리
                 analysis_result["quiz_history"].insert(0, new_set)
                 update_analysis_result(doc_id, analysis_result)
                 st.success(f"새로운 {new_set['set_name']}이 추가되었습니다!")
@@ -553,7 +574,6 @@ elif st.session_state["nav_view"] == "detail":
             st.info("아직 생성된 퀴즈가 없습니다. 상단의 **'🎲 새로운 퀴즈 세트 생성'** 버튼을 눌러 문제를 만들어보세요.")
         else:
             st.markdown("---")
-            # 저장된 회차 선택 드롭다운
             set_names = [q_set["set_name"] for q_set in quiz_history]
             selected_set_name = st.selectbox("📚 다시 볼 퀴즈 세트 선택", set_names, index=0)
             
