@@ -63,8 +63,31 @@ def extract(data, filename):
         return pptx_to_images(data)
     raise ValueError("PDF 또는 PPTX 파일만 지원합니다.")
 
-# ---------- 3. DB 함수 ----------
+# ---------- 3. DB 함수 (폴더 & 문서 영구 보관) ----------
+def fetch_user_folders(username):
+    """사용자가 생성한 모든 폴더 목록을 DB에서 불러옵니다 (빈 폴더 포함)"""
+    try:
+        res = supabase.table("user_folders").select("folder_name").eq("username", username).order("created_at").execute()
+        folders = [r["folder_name"] for r in (res.data or [])]
+        return folders
+    except Exception as e:
+        st.error(f"폴더 목록 조회 오류: {e}")
+        return []
+
+def create_folder_in_db(username, folder_name):
+    """새 폴더를 DB에 영구 등록합니다"""
+    try:
+        supabase.table("user_folders").upsert({
+            "username": username,
+            "folder_name": folder_name
+        }, on_conflict="username,folder_name").execute()
+        return True
+    except Exception as e:
+        st.error(f"폴더 생성 오류: {e}")
+        return False
+
 def fetch_user_data(username):
+    """사용자의 모든 파일 데이터를 DB에서 불러옵니다"""
     try:
         response = supabase.table("user_documents").select("*").eq("username", username).execute()
         return response.data or []
@@ -97,19 +120,19 @@ def delete_document(doc_id):
     supabase.table("user_documents").delete().eq("id", doc_id).execute()
 
 def delete_folder(username, folder_name):
+    """폴더 테이블과 그 안의 모든 문서를 함께 영구 삭제합니다"""
     supabase.table("user_documents").delete().eq("username", username).eq("folder_name", folder_name).execute()
+    supabase.table("user_folders").delete().eq("username", username).eq("folder_name", folder_name).execute()
 
 # ---------- 4. 삭제 확인 모달 팝업 ----------
 @st.dialog("⚠️ 폴더 삭제 확인")
 def confirm_delete_folder_dialog(username, folder_name):
     st.write(f"정말로 **'{folder_name}'** 폴더를 삭제하시겠습니까?")
-    st.warning("폴더 내에 보관된 모든 문서와 AI 요약/퀴즈 데이터가 함께 영구 삭제됩니다.")
+    st.warning("폴더와 그 안에 보관된 모든 문서 및 AI 요약/퀴즈 데이터가 함께 영구 삭제됩니다.")
     c1, c2 = st.columns(2)
     with c1:
         if st.button("예, 삭제합니다", type="primary", use_container_width=True):
             delete_folder(username, folder_name)
-            if folder_name in st.session_state["custom_folders"]:
-                st.session_state["custom_folders"].remove(folder_name)
             st.rerun()
     with c2:
         if st.button("취소", use_container_width=True):
@@ -228,8 +251,6 @@ if "active_folder" not in st.session_state:
     st.session_state["active_folder"] = None
 if "active_doc_id" not in st.session_state:
     st.session_state["active_doc_id"] = None
-if "custom_folders" not in st.session_state:
-    st.session_state["custom_folders"] = []
 
 # ---------- 7. 사이드바 UI ----------
 with st.sidebar:
@@ -249,24 +270,28 @@ with st.sidebar:
     quiz_diff = st.select_slider("난이도", ["Basic", "Intermediate", "Advanced", "Exam Level"], value="Intermediate")
     quiz_model = st.selectbox("Gemini 모델", ["gemini-3.6-flash", "gemini-3.8-flash"], index=0)
 
-# DB에서 사용자 전체 레코드 조회
+# DB에서 사용자 폴더 및 문서 조회
+db_folders = fetch_user_folders(username_input)
 user_records = fetch_user_data(username_input)
 
-# DB에 있는 폴더와 동기화
+# 기존 문서에 저장된 폴더명이 있다면 폴더 테이블에 자동 마이그레이션/동기화
 for r in user_records:
-    f_name = r.get("folder_name")
-    if f_name and f_name not in st.session_state["custom_folders"]:
-        st.session_state["custom_folders"].append(f_name)
+    fn = r.get("folder_name")
+    if fn and fn not in db_folders:
+        create_folder_in_db(username_input, fn)
+        db_folders.append(fn)
 
-if not st.session_state["custom_folders"]:
-    st.session_state["custom_folders"] = ["기본 강의자료"]
+# 사용자의 폴더가 완전히 비어있다면 안내용 '기본 강의자료' 생성
+if not db_folders:
+    create_folder_in_db(username_input, "기본 강의자료")
+    db_folders = ["기본 강의자료"]
 
 # =========================================================
-# 화면 1: 폴더 갤러리
+# 화면 1: 폴더 갤러리 (Folder Gallery)
 # =========================================================
 if st.session_state["nav_view"] == "folder":
     st.title("📂 내 강의자료 폴더")
-    st.caption("폴더를 클릭하여 내부 PPT/PDF 목록을 확인하세요.")
+    st.caption("폴더를 클릭하여 내부 PPT/PDF 목록을 확인하세요. 빈 폴더도 영구 저장됩니다.")
 
     col_nf1, col_nf2 = st.columns([3, 1])
     with col_nf1:
@@ -274,21 +299,19 @@ if st.session_state["nav_view"] == "folder":
     with col_nf2:
         if st.button("➕ 폴더 추가", use_container_width=True) and new_folder_val.strip():
             c_name = new_folder_val.strip()
-            if c_name not in st.session_state["custom_folders"]:
-                st.session_state["custom_folders"].append(c_name)
+            if c_name not in db_folders:
+                create_folder_in_db(username_input, c_name)
                 st.rerun()
 
     st.write("")
 
-    folders = st.session_state["custom_folders"]
     cols_per_row = 3
-    
-    for i in range(0, len(folders), cols_per_row):
+    for i in range(0, len(db_folders), cols_per_row):
         cols = st.columns(cols_per_row)
         for j in range(cols_per_row):
             idx = i + j
-            if idx < len(folders):
-                f_name = folders[idx]
+            if idx < len(db_folders):
+                f_name = db_folders[idx]
                 f_docs = [r for r in user_records if r.get("folder_name") == f_name]
                 file_count = len(f_docs)
                 
@@ -304,11 +327,11 @@ if st.session_state["nav_view"] == "folder":
                                 st.session_state["nav_view"] = "file"
                                 st.rerun()
                         with b_col2:
-                            if st.button("🗑️", key=f"del_f_{f_name}", use_container_width=True, help="폴더 및 내부 문서 삭제"):
+                            if st.button("🗑️", key=f"del_f_{f_name}", use_container_width=True, help="폴더 및 내부 문서 영구 삭제"):
                                 confirm_delete_folder_dialog(username_input, f_name)
 
 # =========================================================
-# 화면 2: 파일 갤러리
+# 화면 2: 파일 갤러리 (File Gallery)
 # =========================================================
 elif st.session_state["nav_view"] == "file":
     curr_f = st.session_state["active_folder"]
@@ -378,7 +401,7 @@ elif st.session_state["nav_view"] == "file":
                                     confirm_delete_file_dialog(doc_id, fname)
 
 # =========================================================
-# 화면 3: 문서 상세 뷰
+# 화면 3: 문서 상세 뷰 (Detail View: 요약 & 퀴즈)
 # =========================================================
 elif st.session_state["nav_view"] == "detail":
     doc_id = st.session_state["active_doc_id"]
