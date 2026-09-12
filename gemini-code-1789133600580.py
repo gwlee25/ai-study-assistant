@@ -8,13 +8,11 @@ from google import genai
 from google.genai import types
 from supabase import create_client, Client
 
-st.set_page_config(page_title="AI 학습 도우미", page_icon="📚", layout="wide")
-st.title("📚 AI 학습 도우미: 클라우드 영구 보관 & 퀴즈 생성기")
+st.set_page_config(page_title="AI 강의 노트 & 퀴즈 갤러리", page_icon="📚", layout="wide")
 
-# ---------- 1. Supabase 클라이언트 초기화 ----------
+# ---------- 1. Supabase 초기화 ----------
 raw_url = st.secrets.get("SUPABASE_URL") or os.getenv("SUPABASE_URL") or ""
 supabase_key = st.secrets.get("SUPABASE_KEY") or os.getenv("SUPABASE_KEY") or ""
-
 supabase_url = raw_url.strip().rstrip("/")
 
 if not supabase_url or not supabase_key:
@@ -27,7 +25,7 @@ def init_supabase(url: str, key: str) -> Client:
 
 supabase = init_supabase(supabase_url, supabase_key)
 
-# ---------- 2. 파일 추출 함수 ----------
+# ---------- 2. 파일 파싱 및 시각자료 추출 (원본 방식) ----------
 def extract_pdf(data):
     reader = PdfReader(io.BytesIO(data))
     pages = []
@@ -65,7 +63,7 @@ def extract(data, filename):
         return pptx_to_images(data)
     raise ValueError("PDF 또는 PPTX 파일만 지원합니다.")
 
-# ---------- 3. DB 작업 헬퍼 함수 ----------
+# ---------- 3. DB 함수 ----------
 def fetch_user_data(username):
     try:
         response = supabase.table("user_documents").select("*").eq("username", username).execute()
@@ -92,16 +90,16 @@ def save_document(username, folder_name, filename, slides):
             "analysis_result": None
         }).execute()
 
-def update_analysis_result(username, folder_name, filename, result):
-    supabase.table("user_documents").update({"analysis_result": result})\
-        .eq("username", username)\
-        .eq("folder_name", folder_name)\
-        .eq("filename", filename).execute()
+def update_analysis_result(doc_id, result):
+    supabase.table("user_documents").update({"analysis_result": result}).eq("id", doc_id).execute()
 
 def delete_document(doc_id):
     supabase.table("user_documents").delete().eq("id", doc_id).execute()
 
-# ---------- 4. Gemini AI 분석 로직 ----------
+def delete_folder(username, folder_name):
+    supabase.table("user_documents").delete().eq("username", username).eq("folder_name", folder_name).execute()
+
+# ---------- 4. Gemini AI 분석 ----------
 def ai_analyze(slides, settings):
     api_key = st.secrets.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY") or settings.get("api_key_input")
     if not api_key:
@@ -194,173 +192,262 @@ Output MUST strictly follow this JSON schema:
 
     return None, f"서버 과부하로 실패했습니다. 잠시 후 다시 시도해주세요. ({last_error})"
 
-# ---------- 5. 사이드바 UI (사용자 식별 & 폴더/퀴즈 설정) ----------
+# ---------- 5. 세션 네비게이션 상태 관리 ----------
+if "nav_view" not in st.session_state:
+    st.session_state["nav_view"] = "folder"  # 'folder' -> 'file' -> 'detail'
+if "active_folder" not in st.session_state:
+    st.session_state["active_folder"] = None
+if "active_doc_id" not in st.session_state:
+    st.session_state["active_doc_id"] = None
+if "custom_folders" not in st.session_state:
+    st.session_state["custom_folders"] = ["기본 강의자료"]
+
+# ---------- 6. 사이드바 UI (계정 및 기본 설정) ----------
 with st.sidebar:
     st.header("👤 계정 접속")
-    username_input = st.text_input("사용자 이름(ID 또는 핀번호)", placeholder="예: user1234, 시험대비").strip()
+    username_input = st.text_input("사용자 이름 / 핀번호", placeholder="예: user1234").strip()
     
     if not username_input:
-        st.warning("계정 이름을 입력해야 개인 저장소가 활성화됩니다.")
+        st.warning("계정 이름을 입력해야 보관함이 활성화됩니다.")
         st.stop()
         
-    st.success(f"접속 계정: **{username_input}**")
+    st.success(f"접속 중: **{username_input}**")
 
-    # DB에서 사용자의 파일 기록 조회
-    user_records = fetch_user_data(username_input)
-    
     st.markdown("---")
-    st.header("📁 폴더 관리")
-    
-    # 세션 상태에 폴더 리스트 초기화 (빈 폴더 증발 방지)
-    if "custom_folders" not in st.session_state:
-        st.session_state["custom_folders"] = ["기본 강의자료"]
-    
-    # DB에 저장된 파일들의 폴더명도 자동으로 리스트에 통합
-    db_folders = [r["folder_name"] for r in user_records if r.get("folder_name")]
-    for df in db_folders:
-        if df not in st.session_state["custom_folders"]:
-            st.session_state["custom_folders"].append(df)
-            
-    col_f_in, col_f_btn = st.columns([2, 1])
-    with col_f_in:
-        new_folder = st.text_input("새 폴더", placeholder="폴더명", label_visibility="collapsed")
-    with col_f_btn:
-        if st.button("➕ 추가"):
-            clean_name = new_folder.strip()
-            if clean_name and clean_name not in st.session_state["custom_folders"]:
-                st.session_state["custom_folders"].append(clean_name)
-                st.session_state["selected_folder_idx"] = len(st.session_state["custom_folders"]) - 1
+    st.header("⚙️ 퀴즈 기본값")
+    quiz_n = st.slider("문제 수", 1, 20, value=10)
+    quiz_types = st.multiselect("문제 유형", ["Multiple Choice", "True/False", "Short Answer"], ["Multiple Choice"])
+    quiz_diff = st.select_slider("난이도", ["Basic", "Intermediate", "Advanced", "Exam Level"], value="Intermediate")
+    quiz_model = st.selectbox("Gemini 모델", ["gemini-3.6-flash", "gemini-3.8-flash"], index=0)
+
+# DB에서 사용자 전체 레코드 조회
+user_records = fetch_user_data(username_input)
+
+# 폴더 리스트 싱크
+for r in user_records:
+    f_name = r.get("folder_name")
+    if f_name and f_name not in st.session_state["custom_folders"]:
+        st.session_state["custom_folders"].append(f_name)
+
+# =========================================================
+# 화면 1: 폴더 갤러리 (Folder Gallery)
+# =========================================================
+if st.session_state["nav_view"] == "folder":
+    st.title("📂 내 강의자료 폴더")
+    st.caption("폴더를 클릭하여 내부 PPT/PDF 목록을 확인하세요.")
+
+    # 상단 새 폴더 생성 바
+    col_nf1, col_nf2 = st.columns([3, 1])
+    with col_nf1:
+        new_folder_val = st.text_input("새 폴더 생성", placeholder="폴더명 입력 (예: 생물학 1강, 유기화학)", label_visibility="collapsed")
+    with col_nf2:
+        if st.button("➕ 폴더 추가", use_container_width=True) and new_folder_val.strip():
+            c_name = new_folder_val.strip()
+            if c_name not in st.session_state["custom_folders"]:
+                st.session_state["custom_folders"].append(c_name)
                 st.rerun()
 
-    # 현재 작업 폴더 선택
-    curr_idx = st.session_state.get("selected_folder_idx", 0)
-    if curr_idx >= len(st.session_state["custom_folders"]):
-        curr_idx = 0
-        
-    current_folder = st.selectbox(
-        "작업 폴더 선택", 
-        st.session_state["custom_folders"], 
-        index=curr_idx
-    )
-    st.session_state["selected_folder_idx"] = st.session_state["custom_folders"].index(current_folder)
-
-    st.markdown("---")
-    st.header("⚙️ 퀴즈 옵션")
-    # 디폴트 10문제 설정
-    n = st.slider("문제 수", 1, 20, value=10)
-    types_selected = st.multiselect("문제 유형", ["Multiple Choice", "True/False", "Short Answer"], ["Multiple Choice"])
-    difficulty = st.select_slider("난이도", ["Basic", "Intermediate", "Advanced", "Exam Level"], value="Intermediate")
-    model = st.selectbox("Gemini 모델", ["gemini-3.6-flash", "gemini-3.8-flash"], index=0)
-
-# ---------- 6. 메인: 파일 업로드 및 DB 동기화 ----------
-st.subheader(f"📂 폴더: `{current_folder}` (계정: `{username_input}`)")
-
-uploaded_files = st.file_uploader("📎 새 강의 자료 업로드 (PPTX, PDF)", type=["pdf", "pptx"], accept_multiple_files=True)
-if uploaded_files:
-    with st.spinner("파일을 분석하여 클라우드에 영구 저장 중..."):
-        for up in uploaded_files:
-            try:
-                extracted_slides = extract(up.getvalue(), up.name)
-                save_document(username_input, current_folder, up.name, extracted_slides)
-            except Exception as e:
-                st.error(f"{up.name} 처리 중 오류: {e}")
-        st.success("클라우드 저장소에 성공적으로 동기화되었습니다!")
-        time.sleep(1)
-        st.rerun()
-
-# 현재 폴더에 속한 문서만 필터링
-folder_docs = [r for r in user_records if r.get("folder_name") == current_folder]
-
-if not folder_docs:
-    st.info(f"'{current_folder}' 폴더에 보관된 파일이 없습니다. 위에서 자료를 업로드해 주세요.")
-    st.stop()
-
-# 파일 선택 및 삭제 UI
-st.markdown("### 📄 보관된 자료 목록")
-doc_map = {r["filename"]: r for r in folder_docs}
-col_sel, col_del = st.columns([3, 1])
-
-with col_sel:
-    selected_filename = st.selectbox("분석할 파일 선택", list(doc_map.keys()))
-with col_del:
     st.write("")
-    if st.button("🗑️ 선택 파일 클라우드에서 삭제"):
-        delete_document(doc_map[selected_filename]["id"])
-        st.rerun()
 
-current_doc = doc_map[selected_filename]
-slides = current_doc["slides_data"]
-analysis_result = current_doc.get("analysis_result")
+    folders = st.session_state["custom_folders"]
+    cols_per_row = 3
+    
+    # 갤러리 카드 레이아웃
+    for i in range(0, len(folders), cols_per_row):
+        cols = st.columns(cols_per_row)
+        for j in range(cols_per_row):
+            idx = i + j
+            if idx < len(folders):
+                f_name = folders[idx]
+                f_docs = [r for r in user_records if r.get("folder_name") == f_name]
+                file_count = len(f_docs)
+                
+                with cols[j]:
+                    with st.container(border=True):
+                        st.markdown(f"### 📁 {f_name}")
+                        st.caption(f"보관된 자료: {file_count}개")
+                        
+                        b_col1, b_col2 = st.columns([2, 1])
+                        with b_col1:
+                            if st.button("📂 열기", key=f"open_f_{f_name}", use_container_width=True):
+                                st.session_state["active_folder"] = f_name
+                                st.session_state["nav_view"] = "file"
+                                st.rerun()
+                        with b_col2:
+                            if f_name != "기본 강의자료":
+                                if st.button("🗑️", key=f"del_f_{f_name}", use_container_width=True, help="폴더 및 내부 문서 삭제"):
+                                    delete_folder(username_input, f_name)
+                                    st.session_state["custom_folders"].remove(f_name)
+                                    st.rerun()
 
-# ---------- 7. 탭 UI ----------
-tab1, tab2, tab3 = st.tabs(["📑 슬라이드 원본", "📝 상세 한국어 요약노트", "🎯 English Quiz (한국어 해설)"])
-
-with tab1:
-    st.info(f"총 {len(slides)}개의 슬라이드/페이지가 보관되어 있습니다.")
-    for s in slides:
-        with st.expander(f"Slide/Page {s['page']}"):
-            st.write(s.get("text") or "(텍스트 없음)")
-            if s.get("images"):
-                st.caption(f"📸 포함된 이미지: {len(s['images'])}개")
-
-with tab2:
-    col_btn, _ = st.columns([1, 3])
-    with col_btn:
-        run_btn = st.button("🚀 상세 요약 & 퀴즈 생성", type="primary")
-
-    if run_btn:
-        settings = {
-            "n": n,
-            "types": ", ".join(types_selected),
-            "difficulty": difficulty,
-            "model": model
-        }
-        with st.spinner("AI가 분석 중입니다... 완료 시 클라우드에 자동 영구 저장됩니다."):
-            result, err = ai_analyze(slides, settings)
-        if err:
-            st.error(err)
-        else:
-            update_analysis_result(username_input, current_folder, selected_filename, result)
-            st.success("분석 완료 및 영구 저장 완료!")
-            analysis_result = result
+# =========================================================
+# 화면 2: 파일 갤러리 (File Gallery)
+# =========================================================
+elif st.session_state["nav_view"] == "file":
+    curr_f = st.session_state["active_folder"]
+    
+    col_nav, _ = st.columns([1, 4])
+    with col_nav:
+        if st.button("⬅️ 전체 폴더 목록으로"):
+            st.session_state["nav_view"] = "folder"
+            st.session_state["active_folder"] = None
             st.rerun()
 
-    if analysis_result:
-        st.markdown("### 📌 전반적인 강의 개요")
-        st.info(analysis_result.get("overall_summary", "요약 내용이 없습니다."))
+    st.title(f"📂 {curr_f}")
+    st.caption("자료를 추가하거나, 카드를 클릭하여 AI 요약 및 퀴즈를 확인하세요.")
 
-        if analysis_result.get("key_terminology"):
-            st.markdown("### 📖 핵심 학술/전문 용어 (Terminology)")
-            cols = st.columns(2)
-            for idx, term in enumerate(analysis_result.get("key_terminology", [])):
-                with cols[idx % 2]:
-                    st.markdown(f"**🔹 {term.get('term_en','')}** ({term.get('term_kr','')})")
-                    st.write(term.get("definition",""))
+    with st.expander("📎 이 폴더에 새 강의자료 업로드 (PPTX, PDF)", expanded=False):
+        uploaded_files = st.file_uploader("파일 선택 (복수 업로드 가능)", type=["pdf", "pptx"], accept_multiple_files=True)
+        if uploaded_files:
+            with st.spinner("파일 및 원본 시각자료를 저장하는 중..."):
+                for up in uploaded_files:
+                    try:
+                        extracted_slides = extract(up.getvalue(), up.name)
+                        save_document(username_input, curr_f, up.name, extracted_slides)
+                    except Exception as e:
+                        st.error(f"{up.name} 처리 오류: {e}")
+                st.success("클라우드 저장소에 성공적으로 보관되었습니다!")
+                time.sleep(1)
+                st.rerun()
 
-        st.markdown("---")
-        st.markdown("### 📑 슬라이드/페이지별 상세 정리")
-        for page_data in analysis_result.get("page_summaries", []):
-            with st.expander(f"📍 [Page {page_data.get('page_num')}] {page_data.get('topic')}", expanded=True):
-                st.markdown("**세부 내용:**")
-                for d in page_data.get("details", []):
-                    st.markdown(f"- {d}")
-                if page_data.get("visual_analysis"):
-                    st.markdown(f"🖼️ **시각자료 분석:** {page_data.get('visual_analysis')}")
+    st.markdown("---")
+    
+    f_docs = [r for r in user_records if r.get("folder_name") == curr_f]
+    
+    if not f_docs:
+        st.info("이 폴더에 저장된 파일이 없습니다. 상단에서 자료를 업로드해 주세요.")
     else:
-        st.info("상단의 **'🚀 상세 요약 & 퀴즈 생성'** 버튼을 누르면 AI 분석이 실행되며 결과가 계정에 영구 저장됩니다.")
+        cols_per_row = 3
+        for i in range(0, len(f_docs), cols_per_row):
+            cols = st.columns(cols_per_row)
+            for j in range(cols_per_row):
+                idx = i + j
+                if idx < len(f_docs):
+                    doc = f_docs[idx]
+                    fname = doc["filename"]
+                    doc_id = doc["id"]
+                    has_analysis = doc.get("analysis_result") is not None
+                    slide_count = len(doc.get("slides_data", []))
+                    
+                    with cols[j]:
+                        with st.container(border=True):
+                            icon = "📊" if fname.endswith(".pptx") else "📄"
+                            st.markdown(f"### {icon} {fname}")
+                            st.write(f"슬라이드/페이지: **{slide_count}장**")
+                            
+                            if has_analysis:
+                                st.success("✅ AI 분석 완료")
+                            else:
+                                st.info("⏳ 미분석 상태")
+                                
+                            c_open, c_del = st.columns([3, 1])
+                            with c_open:
+                                if st.button("📖 열기 및 분석", key=f"open_doc_{doc_id}", use_container_width=True):
+                                    st.session_state["active_doc_id"] = doc_id
+                                    st.session_state["nav_view"] = "detail"
+                                    st.rerun()
+                            with c_del:
+                                if st.button("🗑️", key=f"del_doc_{doc_id}", use_container_width=True, help="파일 삭제"):
+                                    delete_document(doc_id)
+                                    st.rerun()
 
-with tab3:
-    if not analysis_result:
-        st.info("먼저 요약 노트를 생성해 주세요.")
-    else:
-        questions = analysis_result.get("questions", [])
-        st.markdown(f"### 📝 Practice Exam ({len(questions)} Questions)")
-        for idx, q in enumerate(questions, 1):
-            st.markdown(f"#### Q{idx}. {q.get('question')}")
-            st.caption(f"Source: Page {q.get('source_page')} | Type: {q.get('type')}")
-            for ch in q.get("choices", []):
-                st.write(ch)
-            with st.expander(f"정답 및 한국어 해설 확인 (Q{idx})"):
-                st.markdown(f"**Answer:** `{q.get('answer')}`")
-                st.markdown(f"**해설:** {q.get('explanation')}")
-            st.write("")
+# =========================================================
+# 화면 3: 문서 상세 뷰 (Detail View: 요약 & 퀴즈)
+# =========================================================
+elif st.session_state["nav_view"] == "detail":
+    doc_id = st.session_state["active_doc_id"]
+    current_doc = next((r for r in user_records if r["id"] == doc_id), None)
+    
+    if not current_doc:
+        st.warning("문서를 찾을 수 없습니다.")
+        if st.button("⬅️ 목록으로 돌아가기"):
+            st.session_state["nav_view"] = "file"
+            st.rerun()
+        st.stop()
+
+    curr_f = current_doc["folder_name"]
+    fname = current_doc["filename"]
+    slides = current_doc["slides_data"]
+    analysis_result = current_doc.get("analysis_result")
+
+    col_back, _ = st.columns([1, 4])
+    with col_back:
+        if st.button(f"⬅️ '{curr_f}' 파일 목록으로"):
+            st.session_state["nav_view"] = "file"
+            st.session_state["active_doc_id"] = None
+            st.rerun()
+
+    st.title(f"📖 {fname}")
+    st.caption(f"폴더: {curr_f} | 슬라이드 수: {len(slides)}장")
+
+    tab1, tab2, tab3 = st.tabs(["📑 슬라이드 원본", "📝 상세 한국어 요약노트", "🎯 English Quiz (한국어 해설)"])
+
+    with tab1:
+        st.info(f"총 {len(slides)}개의 슬라이드/페이지가 보관되어 있습니다.")
+        for s in slides:
+            with st.expander(f"Slide/Page {s['page']}"):
+                st.write(s.get("text") or "(텍스트 없음)")
+                if s.get("images"):
+                    st.caption(f"📸 포함된 원본 시각자료: {len(s['images'])}개")
+
+    with tab2:
+        col_btn, _ = st.columns([1, 3])
+        with col_btn:
+            run_btn = st.button("🚀 상세 요약 & 퀴즈 생성", type="primary")
+
+        if run_btn:
+            settings = {
+                "n": quiz_n,
+                "types": ", ".join(quiz_types),
+                "difficulty": quiz_diff,
+                "model": quiz_model
+            }
+            with st.spinner("AI가 분석 중입니다... 완료 시 클라우드에 자동 영구 저장됩니다."):
+                result, err = ai_analyze(slides, settings)
+            if err:
+                st.error(err)
+            else:
+                update_analysis_result(doc_id, result)
+                st.success("분석 완료 및 영구 저장 완료!")
+                analysis_result = result
+                st.rerun()
+
+        if analysis_result:
+            st.markdown("### 📌 전반적인 강의 개요")
+            st.info(analysis_result.get("overall_summary", "요약 내용이 없습니다."))
+
+            if analysis_result.get("key_terminology"):
+                st.markdown("### 📖 핵심 학술/전문 용어 (Terminology)")
+                cols = st.columns(2)
+                for idx, term in enumerate(analysis_result.get("key_terminology", [])):
+                    with cols[idx % 2]:
+                        st.markdown(f"**🔹 {term.get('term_en','')}** ({term.get('term_kr','')})")
+                        st.write(term.get("definition",""))
+
+            st.markdown("---")
+            st.markdown("### 📑 슬라이드/페이지별 상세 정리")
+            for page_data in analysis_result.get("page_summaries", []):
+                with st.expander(f"📍 [Page {page_data.get('page_num')}] {page_data.get('topic')}", expanded=True):
+                    st.markdown("**세부 내용:**")
+                    for d in page_data.get("details", []):
+                        st.markdown(f"- {d}")
+                    if page_data.get("visual_analysis"):
+                        st.markdown(f"🖼️ **시각자료 분석:** {page_data.get('visual_analysis')}")
+        else:
+            st.info("상단의 **'🚀 상세 요약 & 퀴즈 생성'** 버튼을 누르면 AI 분석이 실행되며 결과가 계정에 영구 저장됩니다.")
+
+    with tab3:
+        if not analysis_result:
+            st.info("먼저 요약 노트를 생성해 주세요.")
+        else:
+            questions = analysis_result.get("questions", [])
+            st.markdown(f"### 📝 Practice Exam ({len(questions)} Questions)")
+            for idx, q in enumerate(questions, 1):
+                st.markdown(f"#### Q{idx}. {q.get('question')}")
+                st.caption(f"Source: Page {q.get('source_page')} | Type: {q.get('type')}")
+                for ch in q.get("choices", []):
+                    st.write(ch)
+                with st.expander(f"정답 및 한국어 해설 확인 (Q{idx})"):
+                    st.markdown(f"**Answer:** `{q.get('answer')}`")
+                    st.markdown(f"**해설:** {q.get('explanation')}")
+                st.write("")
