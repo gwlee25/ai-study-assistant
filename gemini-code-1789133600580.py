@@ -25,7 +25,7 @@ def init_supabase(url: str, key: str) -> Client:
 
 supabase = init_supabase(supabase_url, supabase_key)
 
-# ---------- 2. 파일 파싱 및 시각자료 추출 (원본 방식) ----------
+# ---------- 2. 파일 파싱 및 시각자료 추출 ----------
 def extract_pdf(data):
     reader = PdfReader(io.BytesIO(data))
     pages = []
@@ -99,7 +99,36 @@ def delete_document(doc_id):
 def delete_folder(username, folder_name):
     supabase.table("user_documents").delete().eq("username", username).eq("folder_name", folder_name).execute()
 
-# ---------- 4. Gemini AI 분석 ----------
+# ---------- 4. 삭제 확인 모달 팝업 ----------
+@st.dialog("⚠️ 폴더 삭제 확인")
+def confirm_delete_folder_dialog(username, folder_name):
+    st.write(f"정말로 **'{folder_name}'** 폴더를 삭제하시겠습니까?")
+    st.warning("폴더 내에 보관된 모든 문서와 AI 요약/퀴즈 데이터가 함께 영구 삭제됩니다.")
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("예, 삭제합니다", type="primary", use_container_width=True):
+            delete_folder(username, folder_name)
+            if folder_name in st.session_state["custom_folders"]:
+                st.session_state["custom_folders"].remove(folder_name)
+            st.rerun()
+    with c2:
+        if st.button("취소", use_container_width=True):
+            st.rerun()
+
+@st.dialog("⚠️ 파일 삭제 확인")
+def confirm_delete_file_dialog(doc_id, filename):
+    st.write(f"정말로 **'{filename}'** 파일을 삭제하시겠습니까?")
+    st.warning("클라우드에 저장된 슬라이드 데이터 및 분석 결과가 영구 삭제됩니다.")
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("예, 삭제합니다", type="primary", use_container_width=True):
+            delete_document(doc_id)
+            st.rerun()
+    with c2:
+        if st.button("취소", use_container_width=True):
+            st.rerun()
+
+# ---------- 5. Gemini AI 분석 ----------
 def ai_analyze(slides, settings):
     api_key = st.secrets.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY") or settings.get("api_key_input")
     if not api_key:
@@ -192,17 +221,17 @@ Output MUST strictly follow this JSON schema:
 
     return None, f"서버 과부하로 실패했습니다. 잠시 후 다시 시도해주세요. ({last_error})"
 
-# ---------- 5. 세션 네비게이션 상태 관리 ----------
+# ---------- 6. 세션 네비게이션 상태 관리 ----------
 if "nav_view" not in st.session_state:
-    st.session_state["nav_view"] = "folder"  # 'folder' -> 'file' -> 'detail'
+    st.session_state["nav_view"] = "folder"
 if "active_folder" not in st.session_state:
     st.session_state["active_folder"] = None
 if "active_doc_id" not in st.session_state:
     st.session_state["active_doc_id"] = None
 if "custom_folders" not in st.session_state:
-    st.session_state["custom_folders"] = ["기본 강의자료"]
+    st.session_state["custom_folders"] = []
 
-# ---------- 6. 사이드바 UI (계정 및 기본 설정) ----------
+# ---------- 7. 사이드바 UI ----------
 with st.sidebar:
     st.header("👤 계정 접속")
     username_input = st.text_input("사용자 이름 / 핀번호", placeholder="예: user1234").strip()
@@ -223,23 +252,25 @@ with st.sidebar:
 # DB에서 사용자 전체 레코드 조회
 user_records = fetch_user_data(username_input)
 
-# 폴더 리스트 싱크
+# DB에 있는 폴더와 동기화
 for r in user_records:
     f_name = r.get("folder_name")
     if f_name and f_name not in st.session_state["custom_folders"]:
         st.session_state["custom_folders"].append(f_name)
 
+if not st.session_state["custom_folders"]:
+    st.session_state["custom_folders"] = ["기본 강의자료"]
+
 # =========================================================
-# 화면 1: 폴더 갤러리 (Folder Gallery)
+# 화면 1: 폴더 갤러리
 # =========================================================
 if st.session_state["nav_view"] == "folder":
     st.title("📂 내 강의자료 폴더")
     st.caption("폴더를 클릭하여 내부 PPT/PDF 목록을 확인하세요.")
 
-    # 상단 새 폴더 생성 바
     col_nf1, col_nf2 = st.columns([3, 1])
     with col_nf1:
-        new_folder_val = st.text_input("새 폴더 생성", placeholder="폴더명 입력 (예: 생물학 1강, 유기화학)", label_visibility="collapsed")
+        new_folder_val = st.text_input("새 폴더 생성", placeholder="새 폴더명 입력 (예: 생물학 1강, 유기화학)", label_visibility="collapsed")
     with col_nf2:
         if st.button("➕ 폴더 추가", use_container_width=True) and new_folder_val.strip():
             c_name = new_folder_val.strip()
@@ -252,7 +283,6 @@ if st.session_state["nav_view"] == "folder":
     folders = st.session_state["custom_folders"]
     cols_per_row = 3
     
-    # 갤러리 카드 레이아웃
     for i in range(0, len(folders), cols_per_row):
         cols = st.columns(cols_per_row)
         for j in range(cols_per_row):
@@ -275,13 +305,10 @@ if st.session_state["nav_view"] == "folder":
                                 st.rerun()
                         with b_col2:
                             if st.button("🗑️", key=f"del_f_{f_name}", use_container_width=True, help="폴더 및 내부 문서 삭제"):
-                                delete_folder(username_input, f_name)
-                                if f_name in st.session_state["custom_folders"]:
-                                    st.session_state["custom_folders"].remove(f_name)
-                                st.rerun()
+                                confirm_delete_folder_dialog(username_input, f_name)
 
 # =========================================================
-# 화면 2: 파일 갤러리 (File Gallery)
+# 화면 2: 파일 갤러리
 # =========================================================
 elif st.session_state["nav_view"] == "file":
     curr_f = st.session_state["active_folder"]
@@ -299,14 +326,14 @@ elif st.session_state["nav_view"] == "file":
     with st.expander("📎 이 폴더에 새 강의자료 업로드 (PPTX, PDF)", expanded=False):
         uploaded_files = st.file_uploader("파일 선택 (복수 업로드 가능)", type=["pdf", "pptx"], accept_multiple_files=True)
         if uploaded_files:
-            with st.spinner("파일 및 원본 시각자료를 저장하는 중..."):
+            with st.spinner("파일 및 시각자료를 저장하는 중..."):
                 for up in uploaded_files:
                     try:
                         extracted_slides = extract(up.getvalue(), up.name)
                         save_document(username_input, curr_f, up.name, extracted_slides)
                     except Exception as e:
                         st.error(f"{up.name} 처리 오류: {e}")
-                st.success("클라우드 저장소에 성공적으로 보관되었습니다!")
+                st.success("클라우드 저장소에 보관되었습니다!")
                 time.sleep(1)
                 st.rerun()
 
@@ -348,11 +375,10 @@ elif st.session_state["nav_view"] == "file":
                                     st.rerun()
                             with c_del:
                                 if st.button("🗑️", key=f"del_doc_{doc_id}", use_container_width=True, help="파일 삭제"):
-                                    delete_document(doc_id)
-                                    st.rerun()
+                                    confirm_delete_file_dialog(doc_id, fname)
 
 # =========================================================
-# 화면 3: 문서 상세 뷰 (Detail View: 요약 & 퀴즈)
+# 화면 3: 문서 상세 뷰
 # =========================================================
 elif st.session_state["nav_view"] == "detail":
     doc_id = st.session_state["active_doc_id"]
