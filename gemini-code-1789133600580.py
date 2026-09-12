@@ -274,11 +274,11 @@ if st.session_state["nav_view"] == "folder":
                                 st.session_state["nav_view"] = "file"
                                 st.rerun()
                         with b_col2:
-                            if f_name != "기본 강의자료":
-                                if st.button("🗑️", key=f"del_f_{f_name}", use_container_width=True, help="폴더 및 내부 문서 삭제"):
-                                    delete_folder(username_input, f_name)
+                            if st.button("🗑️", key=f"del_f_{f_name}", use_container_width=True, help="폴더 및 내부 문서 삭제"):
+                                delete_folder(username_input, f_name)
+                                if f_name in st.session_state["custom_folders"]:
                                     st.session_state["custom_folders"].remove(f_name)
-                                    st.rerun()
+                                st.rerun()
 
 # =========================================================
 # 화면 2: 파일 갤러리 (File Gallery)
